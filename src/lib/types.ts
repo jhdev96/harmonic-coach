@@ -32,6 +32,25 @@ export type MeasureBreakdown = MeasureAnalysis & {
 export type SheetAnalysis = {
   overview: string;
   measures: MeasureBreakdown[];
+  // Present only for scan-extracted charts: song metadata read off the page.
+  title?: string;
+  songKey?: string;
+  timeSignature?: string;
+};
+
+// One measure as read off an uploaded scan, before any analysis.
+export type ExtractedMeasure = {
+  measureIndex: number;
+  chords: string;
+  readConfidence: Confidence;
+  alternateReadings: string[];
+};
+
+export type SheetExtraction = {
+  measures: ExtractedMeasure[];
+  title?: string;
+  songKey?: string;
+  timeSignature?: string;
 };
 
 export type AnalyzeLeadSheetRequest = {
@@ -39,4 +58,37 @@ export type AnalyzeLeadSheetRequest = {
   songKey: string;
   timeSignature: string;
   measures: { index: number; chords: string }[];
+  // When set, analyze only this bar and return a single MeasureBreakdown.
+  targetIndex?: number;
+};
+
+export type AnalyzeScanRequest = {
+  scan: {
+    mediaType: string;
+    dataBase64: string;
+  };
+};
+
+export type AskCoachRequest = {
+  title: string;
+  songKey: string;
+  timeSignature: string;
+  measures: { index: number; chords: string }[];
+  overview?: string;
+  breakdowns?: {
+    measureIndex: number;
+    chords: string;
+    title: string;
+    romanNumeral: string;
+    explanation: string;
+  }[];
+  selectedMeasureIndex?: number;
+  history: { question: string; answer: string }[];
+  question: string;
+};
+
+export type QaEntry = {
+  question: string;
+  answer: string;
+  error?: string;
 };
