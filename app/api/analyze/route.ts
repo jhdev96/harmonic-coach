@@ -1,124 +1,37 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { NextResponse } from "next/server";
 
+import {
+  buildChartPrompt,
+  buildSingleMeasurePrompt,
+  SCAN_EXTRACTION_PROMPT,
+  SCAN_EXTRACTION_SCHEMA,
+  SHEET_ANALYSIS_SCHEMA,
+  SINGLE_MEASURE_SCHEMA,
+  SYSTEM_PROMPT,
+} from "@/src/lib/analysisPrompts";
+import { errorResponse, streamingResponse } from "@/src/lib/anthropicStream";
 import type {
   AnalyzeLeadSheetRequest,
-  SheetAnalysis,
+  AnalyzeScanRequest,
 } from "@/src/lib/types";
+import { MAX_MEASURES, ANTHROPIC_MODEL } from "@/src/lib/constants";
 
-const MAX_MEASURES = 64;
 
-// Structured-output schema: the API guarantees the response parses against
-// this, so the client never has to defensively re-validate shape.
-const SHEET_ANALYSIS_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["overview", "measures"],
-  properties: {
-    overview: {
-      type: "string",
-      description:
-        "Two or three sentences describing the overall harmonic arc of the chart.",
-    },
-    measures: {
-      type: "array",
-      description: "Exactly one entry per measure, in order.",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "measureIndex",
-          "chords",
-          "title",
-          "romanNumeral",
-          "harmonicFunction",
-          "confidence",
-          "explanation",
-          "practiceTip",
-          "alternativeInterpretation",
-        ],
-        properties: {
-          measureIndex: {
-            type: "integer",
-            description: "Zero-based index matching the input measure.",
-          },
-          chords: {
-            type: "string",
-            description: "The chord symbols exactly as given in the input.",
-          },
-          title: {
-            type: "string",
-            description: "Short instructor-style headline, e.g. 'ii–V into IV'.",
-          },
-          romanNumeral: {
-            type: "string",
-            description:
-              "Roman-numeral analysis relative to the song key, e.g. 'iim7–V7/IV'. Empty string for empty measures.",
-          },
-          harmonicFunction: {
-            type: "string",
-            enum: ["tonic", "subdominant", "dominant", "other"],
-            description:
-              "Dominant-function chords (incl. secondary dominants) are 'dominant'. Empty or unclassifiable bars are 'other'.",
-          },
-          confidence: {
-            type: "string",
-            enum: ["High", "Medium", "Low"],
-            description:
-              "How settled this interpretation is. Ambiguous reharmonizations should be Medium or Low.",
-          },
-          explanation: {
-            type: "string",
-            description:
-              "Two to four sentences a piano student can follow: function, voice leading, where the ear is being pulled.",
-          },
-          practiceTip: {
-            type: "string",
-            description:
-              "One concrete at-the-piano exercise for this measure (voicing, isolated resolution, listening focus).",
-          },
-          alternativeInterpretation: {
-            type: ["string", "null"],
-            description:
-              "A second legitimate hearing of the bar, or null when the analysis is unambiguous.",
-          },
-        },
-      },
-    },
-  },
-} as const;
+const SCAN_MEDIA_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "application/pdf",
+] as const;
 
-const SYSTEM_PROMPT = `You are Harmonic Coach, a warm and precise piano instructor who explains lead-sheet harmony to intermediate students.
+// Base64 of ~24MB of data — headroom under the API's 32MB request limit.
+const MAX_SCAN_BASE64_LENGTH = 32_000_000;
 
-You will receive a chord chart: song title, key, time signature, and a numbered list of measures with chord symbols. Analyze the chart measure by measure, always interpreting each bar in the context of the surrounding progression and the stated key — not in isolation.
+// Sonnet 5 over Opus: near-Opus quality on structured analysis at a fraction
+// of the cost and latency. Raise effort if analyses start feeling shallow.
 
-Guidelines:
-- Speak like a teacher at the piano: name the function, then explain what the ear should notice, then how the voice leading moves into the next bar.
-- Roman numerals are relative to the stated key. Use standard jazz notation (iim7, V7, IVmaj7, V7/iii, bVII, etc.).
-- Show your uncertainty honestly. Reharmonizations and modal moments often support more than one hearing — use the confidence field and alternativeInterpretation rather than overclaiming.
-- For a measure with no chords entered, return: title "Empty measure", romanNumeral "", harmonicFunction "other", confidence "Low", an explanation inviting the student to enter chords, and a practice tip about the surrounding bars.
-- If a chord symbol looks malformed or unreadable, say so plainly in the explanation and mark confidence Low. Do not invent an analysis for symbols you cannot read.
-- Practice tips must be physically actionable at the keyboard, referencing specific notes or voicings where possible.`;
-
-function buildChartPrompt(request: AnalyzeLeadSheetRequest): string {
-  const measureLines = request.measures
-    .map(
-      (measure) =>
-        `Bar ${measure.index + 1}: ${measure.chords.trim() || "(empty)"}`,
-    )
-    .join("\n");
-
-  return `Analyze this lead sheet.
-
-Title: ${request.title || "Untitled"}
-Key: ${request.songKey}
-Time signature: ${request.timeSignature}
-
-Measures (measureIndex is the bar number minus 1):
-${measureLines}`;
-}
-
-function parseRequestBody(body: unknown): AnalyzeLeadSheetRequest | null {
+function parseChartRequest(body: unknown): AnalyzeLeadSheetRequest | null {
   if (typeof body !== "object" || body === null) return null;
   const candidate = body as Partial<AnalyzeLeadSheetRequest>;
   if (
@@ -138,7 +51,54 @@ function parseRequestBody(body: unknown): AnalyzeLeadSheetRequest | null {
       typeof measure.index === "number" &&
       typeof measure.chords === "string",
   );
-  return measuresValid ? (candidate as AnalyzeLeadSheetRequest) : null;
+  if (!measuresValid) return null;
+  if (
+    candidate.targetIndex !== undefined &&
+    (typeof candidate.targetIndex !== "number" ||
+      !candidate.measures.some((m) => m.index === candidate.targetIndex))
+  ) {
+    return null;
+  }
+  return candidate as AnalyzeLeadSheetRequest;
+}
+
+function parseScanRequest(body: unknown): AnalyzeScanRequest | null {
+  if (typeof body !== "object" || body === null) return null;
+  const candidate = body as Partial<AnalyzeScanRequest>;
+  const scan = candidate.scan;
+  if (
+    typeof scan !== "object" ||
+    scan === null ||
+    typeof scan.mediaType !== "string" ||
+    typeof scan.dataBase64 !== "string" ||
+    !(SCAN_MEDIA_TYPES as readonly string[]).includes(scan.mediaType) ||
+    scan.dataBase64.length === 0 ||
+    scan.dataBase64.length > MAX_SCAN_BASE64_LENGTH
+  ) {
+    return null;
+  }
+  return { scan: { mediaType: scan.mediaType, dataBase64: scan.dataBase64 } };
+}
+
+function scanContentBlock(scan: AnalyzeScanRequest["scan"]) {
+  if (scan.mediaType === "application/pdf") {
+    return {
+      type: "document" as const,
+      source: {
+        type: "base64" as const,
+        media_type: "application/pdf" as const,
+        data: scan.dataBase64,
+      },
+    };
+  }
+  return {
+    type: "image" as const,
+    source: {
+      type: "base64" as const,
+      media_type: scan.mediaType as "image/png" | "image/jpeg" | "image/webp",
+      data: scan.dataBase64,
+    },
+  };
 }
 
 export async function POST(request: Request) {
@@ -152,10 +112,15 @@ export async function POST(request: Request) {
     );
   }
 
-  const analyzeRequest = parseRequestBody(await request.json().catch(() => null));
-  if (!analyzeRequest) {
+  const body = await request.json().catch(() => null);
+  const scanRequest = parseScanRequest(body);
+  const chartRequest = scanRequest ? null : parseChartRequest(body);
+
+  if (!scanRequest && !chartRequest) {
     return NextResponse.json(
-      { error: `Invalid request. Expected 1–${MAX_MEASURES} measures with chords.` },
+      {
+        error: `Invalid request. Expected a scan upload or 1–${MAX_MEASURES} measures with chords.`,
+      },
       { status: 400 },
     );
   }
@@ -163,74 +128,89 @@ export async function POST(request: Request) {
   const client = new Anthropic();
 
   try {
-    const response = await client.messages.create({
-      model: "claude-opus-4-8",
-      max_tokens: 16000,
+    // Mode 1: scan upload — extraction only (chords + metadata, no analysis
+    // prose), so bars reach the UI fast. The client kicks off the analysis
+    // as a second call on the extracted chart. Higher effort than typed
+    // mode: reading handwriting benefits from care, and the small output
+    // leaves plenty of token headroom for thinking.
+    if (scanRequest) {
+      const stream = await client.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 32000,
+        stream: true,
+        thinking: { type: "adaptive" },
+        system: SCAN_EXTRACTION_PROMPT,
+        output_config: {
+          effort: "high",
+          format: { type: "json_schema", schema: SCAN_EXTRACTION_SCHEMA },
+        },
+        messages: [
+          {
+            role: "user",
+            content: [
+              scanContentBlock(scanRequest.scan),
+              {
+                type: "text",
+                text: "Transcribe this lead sheet.",
+              },
+            ],
+          },
+        ],
+      });
+      return streamingResponse(stream);
+    }
+
+    // Mode 2: re-analyze a single corrected bar. Small response, no stream.
+    if (chartRequest!.targetIndex !== undefined) {
+      const response = await client.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 8000,
+        thinking: { type: "adaptive" },
+        system: SYSTEM_PROMPT,
+        output_config: {
+          effort: "medium",
+          format: { type: "json_schema", schema: SINGLE_MEASURE_SCHEMA },
+        },
+        messages: [
+          {
+            role: "user",
+            content: buildSingleMeasurePrompt(
+              chartRequest!,
+              chartRequest!.targetIndex,
+            ),
+          },
+        ],
+      });
+
+      const textBlock = response.content.find((block) => block.type === "text");
+      if (response.stop_reason !== "end_turn" || !textBlock) {
+        return NextResponse.json(
+          { error: "The model returned no analysis for this bar." },
+          { status: 502 },
+        );
+      }
+      return new Response(textBlock.text, {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
+    }
+
+    // Mode 3: full chart analysis, streamed. 64K output headroom: thinking
+    // tokens count against max_tokens, and a 32-bar chart plus adaptive
+    // thinking can overrun a 16K ceiling (which surfaces as a cut-off).
+    const stream = await client.messages.create({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 64000,
+      stream: true,
       thinking: { type: "adaptive" },
       system: SYSTEM_PROMPT,
       output_config: {
-        format: {
-          type: "json_schema",
-          schema: SHEET_ANALYSIS_SCHEMA,
-        },
+        effort: "medium",
+        format: { type: "json_schema", schema: SHEET_ANALYSIS_SCHEMA },
       },
-      messages: [{ role: "user", content: buildChartPrompt(analyzeRequest) }],
+      messages: [{ role: "user", content: buildChartPrompt(chartRequest!) }],
     });
-
-    if (response.stop_reason === "refusal") {
-      return NextResponse.json(
-        { error: "The model declined to analyze this input." },
-        { status: 502 },
-      );
-    }
-    if (response.stop_reason === "max_tokens") {
-      return NextResponse.json(
-        { error: "Analysis was cut off. Try a shorter chart." },
-        { status: 502 },
-      );
-    }
-
-    const textBlock = response.content.find((block) => block.type === "text");
-    if (!textBlock) {
-      return NextResponse.json(
-        { error: "The model returned no analysis." },
-        { status: 502 },
-      );
-    }
-
-    const analysis = JSON.parse(textBlock.text) as SheetAnalysis;
-
-    // Normalize the wire format: the schema forces alternativeInterpretation
-    // to be present-or-null; the app treats "absent" as the no-alternative case.
-    const normalized: SheetAnalysis = {
-      overview: analysis.overview,
-      measures: analysis.measures.map((measure) => ({
-        ...measure,
-        alternativeInterpretation:
-          measure.alternativeInterpretation ?? undefined,
-      })),
-    };
-
-    return NextResponse.json(normalized);
+    return streamingResponse(stream);
   } catch (error) {
-    if (error instanceof Anthropic.AuthenticationError) {
-      return NextResponse.json(
-        { error: "Anthropic API key was rejected. Check ANTHROPIC_API_KEY." },
-        { status: 500 },
-      );
-    }
-    if (error instanceof Anthropic.RateLimitError) {
-      return NextResponse.json(
-        { error: "Rate limited by the Anthropic API. Try again shortly." },
-        { status: 429 },
-      );
-    }
-    if (error instanceof Anthropic.APIError) {
-      return NextResponse.json(
-        { error: `Anthropic API error: ${error.message}` },
-        { status: 502 },
-      );
-    }
-    throw error;
+    return errorResponse(error);
   }
 }
