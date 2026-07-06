@@ -20,11 +20,11 @@ export default function LeadSheetEditor({
 }: LeadSheetEditorProps) {
   return (
     <section aria-label="Lead sheet" className="flex flex-col gap-5">
-      <div className="flex items-baseline justify-between">
+      <div className="flex items-baseline gap-2">
         <h2 className="font-serif text-2xl tracking-tight text-[var(--foreground)]">
           Lead sheet
         </h2>
-        <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--muted)]">
+        <span className="font-mono text-[11px] tracking-[0.18em] text-[var(--muted)]">
           {measures.length} {measures.length === 1 ? "bar" : "bars"}
         </span>
       </div>
@@ -47,7 +47,7 @@ export default function LeadSheetEditor({
           <span aria-hidden className="text-xl leading-none">
             +
           </span>
-          <span className="font-mono text-xs uppercase tracking-[0.2em]">
+          <span className="font-mono text-xs tracking-[0.2em]">
             Add measure
           </span>
         </button>
