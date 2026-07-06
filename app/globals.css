@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f7f1e3;
+  --background: #f3ebda;
   --foreground: #2a2520;
   --muted: #6b5e4f;
   --card: #fdf8ec;
@@ -15,7 +15,8 @@
   --function-dominant: #c66c5c;
   --function-other: #a89684;
 
-  --shadow-timeline: 0 8px 32px -16px rgba(42, 37, 32, 0.35);
+  --shadow-input: 0 8px 16px -8px rgba(42, 37, 32, 0.15);
+  --shadow-arrow: 0 8px 24px -12px rgba(42, 37, 32, 0.25);
 }
 
 @theme inline {
@@ -42,4 +43,27 @@ body {
 ::selection {
   background: color-mix(in oklab, var(--accent) 30%, transparent);
   color: var(--foreground);
+}
+
+/* Custom select styling - make them look like input fields */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: none !important;
+  background-color: var(--card);
+  color: var(--foreground);
+  border: none;
+  font-size: inherit;
+  font-family: inherit;
+  padding-right: 40px;
+}
+
+select::-ms-expand {
+  display: none;
+}
+
+select::placeholder {
+  color: var(--muted);
+  opacity: 0.6;
 }
